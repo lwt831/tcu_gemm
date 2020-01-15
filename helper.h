@@ -18,7 +18,7 @@ void init_input(half *input_half, float *input_float,size_t size){
 }
 
 void print_matrix(float *mat, size_t M, size_t N){
-	
+	printf("\n");	
 	for(int m=0;m<M;m++){
 		for(int n=0;n<N;n++)
 			printf("%f,", mat[m*M+n]);
