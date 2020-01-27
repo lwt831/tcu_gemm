@@ -8,7 +8,7 @@
 #include <cublas.h>
 #include <cublas_v2.h>
 #include "checkerror.h"
-#include "helper.h"
+#include "helper.cuh"
 
 #define WARP_SIZE (32)
 #define lane_copy_num (8)
@@ -32,10 +32,10 @@ void half_cublas(half *A_h, half *B_h, float *output_h, int M, int N, int K){
 	float zero = 0;
 	cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH);//tensor core on(looks like only available for M, N == 8, 16, )
 
-	cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+	cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_T,
 				 M, N, K,
-				 &one, A_d, CUDA_R_16F, K, B_d, CUDA_R_16F, K,
-				 &zero, output_d, CUDA_R_32F, M, CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+				 &one, A_d, CUDA_R_16F, M, B_d, CUDA_R_16F, N,
+				 &zero, output_d, CUDA_R_32F, M, CUDA_R_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 	cudaDeviceSynchronize();
 
 	cudaMemcpy(output_h, output_d, M*N*sizeof(float), cudaMemcpyDeviceToHost);
@@ -70,8 +70,8 @@ __global__ void compute_hgemm_kernel(half *A, half *B, float *output, float *glo
 	unsigned int kk = (WARPS_PER_BLOCK * blockId + warpId) * WMMA_K * WMMA_M / M;
 	const unsigned int kk_per_it = BLOCKS_PER_GRID * WARPS_PER_BLOCK * WMMA_K * WMMA_M / M;
 	//start point at shared mem of each warp
-	const half *warp_a_buff = a_buff + (warpId * WMMA_M * WMMA_K);
-	const half *warp_b_buff = b_buff + (warpId * WMMA_N * WMMA_K);
+	const half *warp_a_buff = a_buff + (warpId * 256);
+	const half *warp_b_buff = b_buff + (warpId * 256);
 	//shared mem ptr of each lane
 	copy_t *lane_shared_ptr_a = ((copy_t *)warp_a_buff) + (((laneId%8)/2)*8 + laneId/lane_copy_num*2 + laneId%2);
 	copy_t *lane_shared_ptr_b = ((copy_t *)warp_b_buff) + (((laneId%8)/2)*8 + laneId/lane_copy_num*2 + laneId%2);
@@ -80,6 +80,7 @@ __global__ void compute_hgemm_kernel(half *A, half *B, float *output, float *glo
 	copy_t *lane_ptr_b = (copy_t *)(B + kk + (laneId/8)*K) + laneId%8;
 
 	//__syncwarp();
+
 
 	while(kk < K){ //if k = 2^20, on a grid with 80 * 8 = 640 warps, it'll be k/(WMMA_K*4)/640 = 26 iterations/warp
 		*lane_shared_ptr_a = *lane_ptr_a;
@@ -92,7 +93,6 @@ __global__ void compute_hgemm_kernel(half *A, half *B, float *output, float *glo
 		kk += kk_per_it;
 		lane_ptr_a += kk_per_it / lane_copy_num;//move global ptr
 		lane_ptr_b += kk_per_it / lane_copy_num;
-
 	}
 	wmma::store_matrix_sync(c_buff + warpId * 256, C_frag, 16, wmma::mem_row_major);
 	__syncthreads();//必要
@@ -112,12 +112,18 @@ __global__ void compute_hgemm_kernel(half *A, half *B, float *output, float *glo
 				C_frag.x[i] = C_frag.x[i] + fetch_c_frag.x[i];
 			collect_iter++;			
 		}
-
-		wmma::store_matrix_sync(global_block_res + blockId*256, C_frag, 16, wmma::mem_row_major);//store block level res
+		wmma::store_matrix_sync(c_buff, C_frag, 16, wmma::mem_row_major);//store block level res
+		//wmma::store_matrix_sync(global_block_res + blockId*256, C_frag, 16, wmma::mem_row_major);
 	}
-	//__syncthreads();
+
+	__syncthreads();		
+	if(threadIdx.x < 64){
+		int lane_cbuff_index = ((threadIdx.x%16)/4)*16 + threadIdx.x%4 + (threadIdx.x/16)*68;
+		atomicAdd(output+ ((threadIdx.x%16)/4)*4 + (threadIdx.x%16)%4, c_buff[lane_cbuff_index]);
+	}
+
+/*
 	cooperative_groups::this_grid().sync();
-	
 	//naive grid level reduction
 	if(blockId == 0){
 		if(warpId == 0){
@@ -140,7 +146,7 @@ __global__ void compute_hgemm_kernel(half *A, half *B, float *output, float *glo
 			}				
 		}	
 	}
-	
+	*/
 }
 
 template<int BLOCKS_PER_GRID, int WARPS_PER_BLOCK>
@@ -154,7 +160,7 @@ void compute_hgemm(half *A_h, half *B_h, float *output_h, int M, int N, int K){
 	checkCudaErrors(cudaMalloc((void**)&A_d, 4*K*sizeof(half)));
 	checkCudaErrors(cudaMalloc((void**)&B_d, 4*K*sizeof(half)));
 	checkCudaErrors(cudaMalloc((void**)&output_d, M*N*sizeof(float)));
-	checkCudaErrors(cudaMalloc((void**)&global_block_res, BLOCKS_PER_GRID*256*sizeof(float)));
+	//checkCudaErrors(cudaMalloc((void**)&global_block_res, BLOCKS_PER_GRID*256*sizeof(float)));
 	
 	checkCudaErrors(cudaMemcpy(A_d, A_h, M*K*sizeof(half), cudaMemcpyHostToDevice));
 	checkCudaErrors(cudaMemcpy(B_d, B_h, N*K*sizeof(half), cudaMemcpyHostToDevice));
@@ -181,8 +187,10 @@ int main(){
 	float *output = new float[M*N];
 
 	init_input(A, A_f, M*K);
-	init_input(B, B_f, N*K);
-	
+	init_input_const(B, B_f, N*K, 1.0);
+	print_matrix(A, M, N);
+	print_matrix(B, M, N);
+
 	std::cout<<"result with my kernel:"<<std::endl;
 	compute_hgemm<32, 8>(A, B, output, M, N, K);	
 	print_matrix(output, M, N);
