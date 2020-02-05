@@ -24,7 +24,7 @@ run: tallgemm.cu
 	$(NVCC) $(FLAGS) $(LIBFILES) $< -o run
 
 clean:
-	find . -name "*.o" -exec rm -f '{}' ';'
+	#find . -name "*.o" -exec rm -f '{}' ';'
 
 	rm -f run
 

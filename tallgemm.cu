@@ -9,11 +9,9 @@
 #include <cublas_v2.h>
 #include "checkerror.h"
 #include "helper.cuh"
+#include "gemm_kernel.cuh" 
+#include "gemm_fastcopy.cuh" 
 
-#define WARP_SIZE (32)
-#define lane_copy_num (8)
-
-using namespace nvcuda;
 
 void half_cublas(half *A_h, half *B_h, float *output_h, int M, int N, int K){
 	cublasHandle_t handle;
@@ -32,9 +30,10 @@ void half_cublas(half *A_h, half *B_h, float *output_h, int M, int N, int K){
 	float zero = 0;
 	cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH);//tensor core on(looks like only available for M, N == 8, 16, )
 
-	cublasGemmEx(handle, CUBLAS_OP_N, CUBLAS_OP_T,
+
+	cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
 				 M, N, K,
-				 &one, A_d, CUDA_R_16F, M, B_d, CUDA_R_16F, N,
+				 &one, A_d, CUDA_R_16F, K, B_d, CUDA_R_16F, K,
 				 &zero, output_d, CUDA_R_32F, M, CUDA_R_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
 	cudaDeviceSynchronize();
 
@@ -46,108 +45,6 @@ void half_cublas(half *A_h, half *B_h, float *output_h, int M, int N, int K){
 
 }
 
-//先用模板，之后改成常数
-template<int BLOCKS_PER_GRID, int WARPS_PER_BLOCK, int WMMA_M, int WMMA_N, int WMMA_K>
-__global__ void compute_hgemm_kernel(half *A, half *B, float *output, float *global_block_res, int M, int N, int K){
-
-	const unsigned int blockId = blockIdx.x;
-	const unsigned int warpId = threadIdx.x / WARP_SIZE;
-	const unsigned int laneId = threadIdx.x % WARP_SIZE;
-
-	//const unsigned int all_iters = K/WMMA_K;
-	typedef int4 copy_t;
-
-	__shared__ half a_buff[WARPS_PER_BLOCK*16*16];
-	__shared__ half b_buff[WARPS_PER_BLOCK*16*16];
-	__shared__ float c_buff[WARPS_PER_BLOCK*16*16];
-
-	wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> A_frag;
-	wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> B_frag;
-	wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> C_frag;
-	wmma::fill_fragment(C_frag, 0.0f);
-
-	//loop over K 
-	unsigned int kk = (WARPS_PER_BLOCK * blockId + warpId) * WMMA_K * WMMA_M / M;
-	const unsigned int kk_per_it = BLOCKS_PER_GRID * WARPS_PER_BLOCK * WMMA_K * WMMA_M / M;
-	//start point at shared mem of each warp
-	const half *warp_a_buff = a_buff + (warpId * 256);
-	const half *warp_b_buff = b_buff + (warpId * 256);
-	//shared mem ptr of each lane
-	copy_t *lane_shared_ptr_a = ((copy_t *)warp_a_buff) + (((laneId%8)/2)*8 + laneId/lane_copy_num*2 + laneId%2);
-	copy_t *lane_shared_ptr_b = ((copy_t *)warp_b_buff) + (((laneId%8)/2)*8 + laneId/lane_copy_num*2 + laneId%2);
-	//global ptr of each lane
-	copy_t *lane_ptr_a = (copy_t *)(A + kk + (laneId/8)*K) + laneId%8;
-	copy_t *lane_ptr_b = (copy_t *)(B + kk + (laneId/8)*K) + laneId%8;
-
-	//__syncwarp();
-
-
-	while(kk < K){ //if k = 2^20, on a grid with 80 * 8 = 640 warps, it'll be k/(WMMA_K*4)/640 = 26 iterations/warp
-		*lane_shared_ptr_a = *lane_ptr_a;
-		*lane_shared_ptr_b = *lane_ptr_b;
-
-		wmma::load_matrix_sync(A_frag, warp_a_buff, 16);
-		wmma::load_matrix_sync(B_frag, warp_b_buff, 16);
-		wmma::mma_sync(C_frag, A_frag, B_frag, C_frag);
-
-		kk += kk_per_it;
-		lane_ptr_a += kk_per_it / lane_copy_num;//move global ptr
-		lane_ptr_b += kk_per_it / lane_copy_num;
-	}
-	wmma::store_matrix_sync(c_buff + warpId * 256, C_frag, 16, wmma::mem_row_major);
-	__syncthreads();//必要
-
-	//naive block level reduction
-	if(warpId == 0){
-		wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> fetch_c_frag;
-		wmma::fill_fragment(A_frag, 0.0f);
-		wmma::fill_fragment(B_frag, 0.0f);
-
-		int collect_iter = 1;
-#pragma unroll
-		while(collect_iter < WARPS_PER_BLOCK){
-			wmma::load_matrix_sync(fetch_c_frag, c_buff + collect_iter*256, 16, wmma::mem_row_major);
-#pragma unroll
-			for(int i=0;i<C_frag.num_elements;i++)
-				C_frag.x[i] = C_frag.x[i] + fetch_c_frag.x[i];
-			collect_iter++;			
-		}
-		wmma::store_matrix_sync(c_buff, C_frag, 16, wmma::mem_row_major);//store block level res
-		//wmma::store_matrix_sync(global_block_res + blockId*256, C_frag, 16, wmma::mem_row_major);
-	}
-
-	__syncthreads();		
-	if(threadIdx.x < 64){
-		int lane_cbuff_index = ((threadIdx.x%16)/4)*16 + threadIdx.x%4 + (threadIdx.x/16)*68;
-		atomicAdd(output+ ((threadIdx.x%16)/4)*4 + (threadIdx.x%16)%4, c_buff[lane_cbuff_index]);
-	}
-
-/*
-	cooperative_groups::this_grid().sync();
-	//naive grid level reduction
-	if(blockId == 0){
-		if(warpId == 0){
-			wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> fetch_c_frag;
-			int global_collect_iter = 1;
-			while(global_collect_iter < BLOCKS_PER_GRID){
-				wmma::load_matrix_sync(fetch_c_frag, global_block_res + global_collect_iter*256, 16, wmma::mem_row_major);
-#pragma unroll
-				for(int i=0;i<C_frag.num_elements;i++)
-					C_frag.x[i] = C_frag.x[i] + fetch_c_frag.x[i];
-				global_collect_iter++;
-			}
-			wmma::store_matrix_sync(c_buff, C_frag, 16, wmma::mem_row_major);
-
-			int lane_cbuff_index = (laneId/4)*16 + laneId%4;
-			if(laneId < 16){//16 threads to reduce 4*16 elements to 16 elements				
-				for(int i=1;i<4;i++)
-					c_buff[lane_cbuff_index] += c_buff[lane_cbuff_index+i*68];//68 = 4*16+4
-				output[laneId] = c_buff[lane_cbuff_index];
-			}				
-		}	
-	}
-	*/
-}
 
 template<int BLOCKS_PER_GRID, int WARPS_PER_BLOCK>
 void compute_hgemm(half *A_h, half *B_h, float *output_h, int M, int N, int K){
@@ -157,47 +54,56 @@ void compute_hgemm(half *A_h, half *B_h, float *output_h, int M, int N, int K){
 	float *output_d;
 	float *global_block_res;//buffer for storing block level result
 
-	checkCudaErrors(cudaMalloc((void**)&A_d, 4*K*sizeof(half)));
-	checkCudaErrors(cudaMalloc((void**)&B_d, 4*K*sizeof(half)));
+	checkCudaErrors(cudaMalloc((void**)&A_d, M*K*sizeof(half)));
+	checkCudaErrors(cudaMalloc((void**)&B_d, N*K*sizeof(half)));
 	checkCudaErrors(cudaMalloc((void**)&output_d, M*N*sizeof(float)));
 	//checkCudaErrors(cudaMalloc((void**)&global_block_res, BLOCKS_PER_GRID*256*sizeof(float)));
 	
 	checkCudaErrors(cudaMemcpy(A_d, A_h, M*K*sizeof(half), cudaMemcpyHostToDevice));
 	checkCudaErrors(cudaMemcpy(B_d, B_h, N*K*sizeof(half), cudaMemcpyHostToDevice));
 
-	checkKernelErrors( (compute_hgemm_kernel<BLOCKS_PER_GRID, WARPS_PER_BLOCK, 16, 16, 16><<<BLOCKS_PER_GRID, WARPS_PER_BLOCK*WARP_SIZE>>>(A_d, B_d, output_d, global_block_res, 4, 4, K)) );
+	int tail_k = K - (K % ((16 / M) * 16)); 
+	std::cout<<"tail_k"<<tail_k<<std::endl;
+	if(M == 3)
+		checkKernelErrors( (compute_hgemm_kernel3_slow<BLOCKS_PER_GRID, WARPS_PER_BLOCK, 16, 16, 16><<<BLOCKS_PER_GRID, WARPS_PER_BLOCK*WARP_SIZE>>>(A_d, B_d, output_d, 3, 3, K, tail_k)) );
+		//checkKernelErrors( (compute_hgemm_kernel3<BLOCKS_PER_GRID, WARPS_PER_BLOCK, 16, 16, 16><<<BLOCKS_PER_GRID, WARPS_PER_BLOCK*WARP_SIZE>>>(A_d, B_d, output_d, 3, 3, K, tail_k)) );
+	if(M == 4)
+		checkKernelErrors( (compute_hgemm_kernel4_slow<BLOCKS_PER_GRID, WARPS_PER_BLOCK, 16, 16, 16><<<BLOCKS_PER_GRID, WARPS_PER_BLOCK*WARP_SIZE>>>(A_d, B_d, output_d, 4, 4, K, tail_k)) );
+		//checkKernelErrors( (compute_hgemm_kernel4<BLOCKS_PER_GRID, WARPS_PER_BLOCK, 16, 16, 16><<<BLOCKS_PER_GRID, WARPS_PER_BLOCK*WARP_SIZE>>>(A_d, B_d, output_d, 4, 4, K, tail_k)) );
+	if(M == 8)
+		checkKernelErrors( (compute_hgemm_kernel8<BLOCKS_PER_GRID, WARPS_PER_BLOCK, 16, 16, 16><<<BLOCKS_PER_GRID, WARPS_PER_BLOCK*WARP_SIZE>>>(A_d, B_d, output_d, 8, 8, K)) );
 	checkCudaErrors(cudaDeviceSynchronize());
 
 	checkCudaErrors(cudaMemcpy(output_h, output_d, M*N*sizeof(float), cudaMemcpyDeviceToHost));
 	cudaFree(A_d);
 	cudaFree(B_d);
 	cudaFree(output_d);
-	cudaFree(global_block_res);
+	//cudaFree(global_block_res);
 }
 
 int main(){
-	const int M = 4;
-	const int N = 4;
-	const int K = 1<<10;
+	const int M = 3;
+	const int N = 3;
+	const int K = 6400;
 
 	half *A = new half[M*K];
 	float *A_f = new float[M*K];
 	half *B = new half[N*K];
 	float *B_f = new float[N*K];
 	float *output = new float[M*N];
+	float *output_cublas = new float[M*N];
 
+	//init_input_const(A, A_f, M*K/2, 1.0f);
 	init_input(A, A_f, M*K);
-	init_input_const(B, B_f, N*K, 1.0);
-	print_matrix(A, M, N);
-	print_matrix(B, M, N);
+	init_input(B, B_f, N*K);
 
 	std::cout<<"result with my kernel:"<<std::endl;
-	compute_hgemm<32, 8>(A, B, output, M, N, K);	
+	compute_hgemm<64, 8>(A, B, output, M, N, K);//num of warps should >= 4	
 	print_matrix(output, M, N);
 
 	std::cout<<"result with cublas:"<<std::endl;
-	half_cublas(A, B, output, M, N, K);
-	print_matrix(output, M, N);
+	half_cublas(A, B, output_cublas, M, N, K);
+	print_matrix(output_cublas, M, N);
 
 	delete []A;
 	delete []A_f;

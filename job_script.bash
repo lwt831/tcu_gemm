@@ -7,5 +7,6 @@ make
 nvprof ./run
 #nvprof --print-gpu-trace ./run
 #nvprof --metrics achieved_occupancy ./run
+#nvidia-smi
 
 make clean

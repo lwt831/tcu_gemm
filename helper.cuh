@@ -60,4 +60,47 @@ __device__ void print_matrix_device(float *mat, size_t M, size_t N){
 		}
 }
 
+
+struct GpuTimer
+{
+  cudaEvent_t start;
+  cudaEvent_t stop;
+
+  GpuTimer()
+  {
+    // create events 
+	cudaEventCreate(&start);
+	cudaEventCreate(&stop);
+  }
+
+  ~GpuTimer()
+  {
+    // delete events 
+    cudaEventDestroy(start);
+	cudaEventDestroy(stop);
+  }
+
+  void Start()
+  {
+    // start event
+    cudaEventRecord(start,0);
+  }
+
+  void Stop()
+  {
+    // stop event
+    cudaEventRecord(stop,0);
+  }
+
+  float Elapsed()
+  {
+    // elapsed time 
+	cudaEventSynchronize(stop);
+	float elapsed;
+    cudaEventElapsedTime(&elapsed, start, stop); 
+    return elapsed;
+  }
+};
+
+
 #endif
