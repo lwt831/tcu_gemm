@@ -84,7 +84,7 @@ void compute_hgemm(half *A_h, half *B_h, float *output_h, int M, int N, int K){
 int main(){
 	const int M = 3;
 	const int N = 3;
-	const int K = 6400;
+	const int K = 1502;
 
 	half *A = new half[M*K];
 	float *A_f = new float[M*K];
@@ -94,7 +94,9 @@ int main(){
 	float *output_cublas = new float[M*N];
 
 	//init_input_const(A, A_f, M*K/2, 1.0f);
+	srand((int)time(0));
 	init_input(A, A_f, M*K);
+	srand((int)time(0) + 1);
 	init_input(B, B_f, N*K);
 
 	std::cout<<"result with my kernel:"<<std::endl;
