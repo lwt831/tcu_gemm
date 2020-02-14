@@ -82,9 +82,9 @@ void compute_hgemm(half *A_h, half *B_h, float *output_h, int M, int N, int K){
 }
 
 int main(){
-	const int M = 3;
-	const int N = 3;
-	const int K = 1502;
+	const int M = 8;
+	const int N = 8;
+	const int K = 8000;
 
 	half *A = new half[M*K];
 	float *A_f = new float[M*K];

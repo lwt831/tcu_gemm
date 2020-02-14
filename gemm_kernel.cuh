@@ -49,7 +49,7 @@ __global__ void compute_hgemm_kernel4_slow(half *A, half *B, float *output, int 
 	copy_t *lane_ptr_b = B + kk + laneId;
 
 	
-	if(blockId == BLOCKS_PER_GRID && threadIdx.x < 256){
+	if(blockId == 0 && threadIdx.x < 256){
 		if((threadIdx.x % 64) < K - tail_k){
 			half *lane_ptr_taila = A + (threadIdx.x/64)*K + threadIdx.x % 64 + tail_k;
 			half *lane_ptr_tailb = B + (threadIdx.x/64)*K + threadIdx.x % 64 + tail_k;
@@ -309,8 +309,8 @@ __global__ void compute_hgemm_kernel8(half *A, half *B, float *output,int M, int
 		wmma::mma_sync(C_frag, A_frag, B_frag, C_frag);
 
 		kk += kk_per_it;
-		lane_ptr_a += A + kk + laneId;//move global ptr
-		lane_ptr_b += B + kk + laneId;
+		lane_ptr_a = A + kk + laneId;//move global ptr
+		lane_ptr_b = B + kk + laneId;
 	}
 	wmma::store_matrix_sync(c_buff + warpId * 256, C_frag, 16, wmma::mem_row_major);
 	__syncthreads();//必要
