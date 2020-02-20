@@ -6,8 +6,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
-#include <cusp/coo_matrix.h>
-#include<cusp/io/matrix_market.h>
+
 
 void init_input(half *input_half, float *input_float,size_t size){
 	//srand((int)time(0));
@@ -62,15 +61,8 @@ __device__ void print_matrix_device(float *mat, size_t M, size_t N){
 		}
 }
 
-//read in fp16 coo matirx from mtx file
-void read_mtx_half(half *value, int *row_index, int *col_index, const char *filename){
-	cusp::coo_matrix<int,float,cusp::host_memory> temp_fp32;
-	cusp::io::read_matrix_market_file(temp_fp32,filename);
 
-	
-}
-
-
+//gpu event timer
 struct GpuTimer
 {
   cudaEvent_t start;
