@@ -17,7 +17,7 @@ void init_input(half *input_half, float *input_float,size_t size){
 	}
 }
 
-void init_input_const(half *input_half, float *input_float,size_t size, float val){
+void init_input(half *input_half, float *input_float,size_t size, float val){
 	for(int i=0;i<size;i++){
 	  input_float[i] = val;
 	  //input_half[i] = __float2half(((float)(input_float[i])-1.0f+0.25f));

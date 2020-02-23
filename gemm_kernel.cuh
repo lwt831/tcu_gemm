@@ -36,8 +36,8 @@ __global__ void compute_hgemm_kernel4_slow(half *A, half *B, float *output, int 
 	wmma::fill_fragment(C_frag, 0.0f);
 
 	//loop over K 
-	unsigned int kk = (WARPS_PER_BLOCK * blockId + warpId) * WMMA_K * WMMA_M / M;
-	const unsigned int kk_per_it = BLOCKS_PER_GRID * WARPS_PER_BLOCK * WMMA_K * WMMA_M / M;
+	unsigned int kk = (WARPS_PER_BLOCK * blockId + warpId) * WMMA_K * (WMMA_M / M);
+	const unsigned int kk_per_it = BLOCKS_PER_GRID * WARPS_PER_BLOCK * WMMA_K * (WMMA_M / M);
 	//start point at shared mem of each warp
 	const half *warp_a_buff = a_buff + (warpId * 256);
 	const half *warp_b_buff = b_buff + (warpId * 256);
@@ -45,59 +45,47 @@ __global__ void compute_hgemm_kernel4_slow(half *A, half *B, float *output, int 
 	copy_t *lane_shared_ptr_a = (copy_t *)(warp_a_buff + (laneId/16)*64 + laneId%16);
 	copy_t *lane_shared_ptr_b = (copy_t *)(warp_b_buff + (laneId/16)*64 + laneId%16);
 	//global ptr of each lane
+	// copy_t *lane_ptr_a = A + kk + laneId;
+	// copy_t *lane_ptr_b = B + kk + laneId;
 	copy_t *lane_ptr_a = A + kk + laneId;
-	copy_t *lane_ptr_b = B + kk + laneId;
-
+	copy_t *lane_ptr_b = B + (kk + laneId) * N;
 	
-	if(blockId == 0 && threadIdx.x < 256){
-		if((threadIdx.x % 64) < K - tail_k){
-			half *lane_ptr_taila = A + (threadIdx.x/64)*K + threadIdx.x % 64 + tail_k;
-			half *lane_ptr_tailb = B + (threadIdx.x/64)*K + threadIdx.x % 64 + tail_k;
-			tail_buffer[((threadIdx.x%64)/16)*64 + (threadIdx.x/64)*16 + threadIdx.x%16] =  *lane_ptr_taila;
-			tail_buffer[((threadIdx.x%64)/16)*64 + (threadIdx.x/64)*16 + threadIdx.x%16 + 256] =  *lane_ptr_tailb;
-		}
-		__syncthreads();//必要
-		if(warpId == 0){ 
-			wmma::load_matrix_sync(A_frag, tail_buffer, 16);
-			wmma::load_matrix_sync(B_frag, tail_buffer + 256, 16);
-			wmma::mma_sync(C_frag, A_frag, B_frag, C_frag);
-		}
-	}
+	// if(blockId == 0 && threadIdx.x < 256){
+	// 	if((threadIdx.x % 64) < K - tail_k){
+	// 		half *lane_ptr_taila = A + (threadIdx.x/64)*K + threadIdx.x % 64 + tail_k;
+	// 		half *lane_ptr_tailb = B + (threadIdx.x/64) + (threadIdx.x % 64 + tail_k) * N;
+	// 		tail_buffer[((threadIdx.x%64)/16)*64 + (threadIdx.x/64)*16 + threadIdx.x%16] =  *lane_ptr_taila;
+	// 		tail_buffer[((threadIdx.x%64)/16)*64 + (threadIdx.x/64)*16 + threadIdx.x%16 + 256] =  *lane_ptr_tailb;
+	// 	}
+	// 	__syncthreads();//必要
+	// 	if(warpId == 0){ 
+	// 		wmma::load_matrix_sync(A_frag, tail_buffer, 16);
+	// 		wmma::load_matrix_sync(B_frag, tail_buffer + 256, 16);
+	// 		wmma::mma_sync(C_frag, A_frag, B_frag, C_frag);
+	// 	}
+	// }
 
-	while(kk < tail_k){ //if k = 2^20, on a grid with 80 * 8 = 640 warps, it'll be k/(WMMA_K*4)/640 = 26 iterations/warp
+	while(kk < K){ //if k = 2^20, on a grid with 80 * 8 = 640 warps, it'll be k/(WMMA_K*4)/640 = 26 iterations/warp
 		for(int i = 0; i < M; i++){
-			*lane_shared_ptr_a = *lane_ptr_a;
-			*lane_shared_ptr_b = *lane_ptr_b;
-
-			lane_shared_ptr_a += 16;
-			lane_shared_ptr_b += 16;
-			lane_ptr_a += K;
-			lane_ptr_b += K;
+			// *(lane_shared_ptr_a + i * 16) = *(lane_ptr_a + i * K);
+			// *(lane_shared_ptr_b + i * 16) = *(lane_ptr_b + i * K);
+			*(lane_shared_ptr_a + i * 16) = *(lane_ptr_a + i * K);
+			*(lane_shared_ptr_b + i * 16) = *(lane_ptr_b + i);
 		}
 
-		lane_shared_ptr_a += 64;
-		lane_shared_ptr_b += 64;
-		lane_ptr_a = A + kk + laneId + 32;
-		lane_ptr_b = B + kk + laneId + 32;
 
 		for(int i = 0; i < M; i++){
-			*lane_shared_ptr_a = *lane_ptr_a;
-			*lane_shared_ptr_b = *lane_ptr_b;
-
-			lane_shared_ptr_a += 16;
-			lane_shared_ptr_b += 16;
-			lane_ptr_a += K;
-			lane_ptr_b += K;
+			*(lane_shared_ptr_a + i * 16 + 128) = *(lane_ptr_a + i * K + 32);
+			*(lane_shared_ptr_b + i * 16 + 128) = *(lane_ptr_b + i + 128);
 		}
 
 		wmma::load_matrix_sync(A_frag, warp_a_buff, 16);
 		wmma::load_matrix_sync(B_frag, warp_b_buff, 16);
 		wmma::mma_sync(C_frag, A_frag, B_frag, C_frag);
 
-
 		kk += kk_per_it;
-		lane_ptr_a = A + kk + laneId;
-		lane_ptr_b = B + kk + laneId;
+		lane_ptr_a += kk_per_it;
+		lane_ptr_b += kk_per_it * N;
 	}
 	wmma::store_matrix_sync(c_buff + warpId * 256, C_frag, 16, wmma::mem_row_major);
 	__syncthreads();//必要
@@ -124,6 +112,11 @@ __global__ void compute_hgemm_kernel4_slow(half *A, half *B, float *output, int 
 	if(threadIdx.x < 64){
 		int lane_cbuff_index = ((threadIdx.x%16)/4)*16 + threadIdx.x%4 + (threadIdx.x/16)*68;
 		atomicAdd(output + (threadIdx.x%16), c_buff[lane_cbuff_index]);
+		//local atomic -> global atomic
+		// atomicAdd(c_buff  + 256 + (threadIdx.x%16), c_buff[lane_cbuff_index]);
+		// if(threadIdx.x < 16){
+		// 	atomicAdd(output + (threadIdx.x%16), c_buff[256 + lane_cbuff_index]);
+		// }
 	}
 	
 }
@@ -162,12 +155,15 @@ __global__ void compute_hgemm_kernel3_slow(half *A, half *B, float *output, int 
 	copy_t *lane_shared_ptr_b = (copy_t *)(warp_b_buff + (laneId/16)*48 + laneId%16);
 	//global ptr of each lane
 	copy_t *lane_ptr_a = A + kk + laneId;
-	copy_t *lane_ptr_b = B + kk + laneId;
+	copy_t *lane_ptr_b = B + (kk + laneId) * N;
 
 	if(blockId == 0){
+		tail_buffer[threadIdx.x] = (half)0;
+		//tail_buffer[threadIdx.x + 256] = (half)0;
+
 		if((threadIdx.x % 80 ) < K - tail_k && threadIdx.x < 240){
 			half *lane_ptr_taila = A + (threadIdx.x/80)*K + threadIdx.x % 80 + tail_k;
-			half *lane_ptr_tailb = B + (threadIdx.x/80)*K + threadIdx.x % 80 + tail_k;
+			half *lane_ptr_tailb = B + (threadIdx.x/80) + (threadIdx.x % 80 + tail_k) * N;
 			tail_buffer[((threadIdx.x%80)/16)*48 + (threadIdx.x/80)*16 + threadIdx.x%16] =  *lane_ptr_taila;
 			tail_buffer[((threadIdx.x%80)/16)*48 + (threadIdx.x/80)*16 + threadIdx.x%16 + 256] =  *lane_ptr_tailb;
 		}
@@ -181,42 +177,17 @@ __global__ void compute_hgemm_kernel3_slow(half *A, half *B, float *output, int 
 
     while(kk < tail_k){
 		for(int i = 0; i < M; i++){
-		    *lane_shared_ptr_a = *lane_ptr_a;
-			*lane_shared_ptr_b = *lane_ptr_b;
-			
-			lane_shared_ptr_a += 16;
-			lane_shared_ptr_b += 16;
-			lane_ptr_a += K;
-			lane_ptr_b += K;
+		    *(lane_shared_ptr_a + i * 16) = *(lane_ptr_a + i * K);
+			*(lane_shared_ptr_b + i * 16) = *(lane_ptr_b + i);
 		}		
-		lane_shared_ptr_a += 48;
-		lane_shared_ptr_b += 48;
-		lane_ptr_a = A + kk + laneId + 32;
-		lane_ptr_b = B + kk + laneId + 32;
-
 		for(int i = 0; i < M; i++){
-		    *lane_shared_ptr_a = *lane_ptr_a;
-			*lane_shared_ptr_b = *lane_ptr_b;
-			
-			lane_shared_ptr_a += 16;
-			lane_shared_ptr_b += 16;
-			lane_ptr_a += K;
-			lane_ptr_b += K;
+			*(lane_shared_ptr_a + i * 16 + 96) = *(lane_ptr_a + i * K + 32);
+			*(lane_shared_ptr_b + i * 16 + 96) = *(lane_ptr_b + i + 96);
 		}
-		lane_shared_ptr_a += 48;
-		lane_shared_ptr_b += 48;
-		lane_ptr_a = A + kk + laneId + 64;
-		lane_ptr_b = B + kk + laneId + 64;
-
 		for(int i = 0; i < M; i++){
 			if(laneId < 16){
-				*lane_shared_ptr_a = *lane_ptr_a;
-				*lane_shared_ptr_b = *lane_ptr_b;
-				
-				lane_shared_ptr_a += 16;
-				lane_shared_ptr_b += 16;
-				lane_ptr_a += K;
-				lane_ptr_b += K;
+				*(lane_shared_ptr_a + i * 16 + 192) = *(lane_ptr_a + i * K + 64);
+				*(lane_shared_ptr_b + i * 16 + 192) = *(lane_ptr_b + i + 192);
 			}
 		}
 
@@ -225,8 +196,8 @@ __global__ void compute_hgemm_kernel3_slow(half *A, half *B, float *output, int 
 		wmma::mma_sync(C_frag, A_frag, B_frag, C_frag);
 
 		kk += kk_per_it;
-		lane_ptr_a = A + kk + laneId;
-		lane_ptr_b = B + kk + laneId;
+		lane_ptr_a += kk_per_it;
+		lane_ptr_b += kk_per_it * N;
 	}
 	wmma::store_matrix_sync(c_buff + warpId * 256, C_frag, 16, wmma::mem_row_major);
 	__syncthreads();//必要
@@ -291,17 +262,12 @@ __global__ void compute_hgemm_kernel8_slow(half *A, half *B, float *output,int M
 	copy_t *lane_shared_ptr_b = (copy_t *)(warp_b_buff + (laneId/16)*128 + laneId%16);
 	//global ptr of each lane
 	copy_t *lane_ptr_a = A + kk + laneId;//mod
-	copy_t *lane_ptr_b = B + kk + laneId;
+	copy_t *lane_ptr_b = B + (kk + laneId) * N;
 
     while(kk < K){ //if k    = 2^20, on a grid with 80 * 8 = 640 warps, it'll be k/(WMMA_K*4)/640 = 26 iterations/warp
 		for(int i = 0; i < M; i++){
-			*lane_shared_ptr_a = *lane_ptr_a;
-			*lane_shared_ptr_b = *lane_ptr_b;
-
-			lane_shared_ptr_a += 16;
-			lane_shared_ptr_b += 16;
-			lane_ptr_a += K;
-			lane_ptr_b += K;
+			*(lane_shared_ptr_a + i * 16) = *(lane_ptr_a + i * K);
+			*(lane_shared_ptr_b + i * 16) = *(lane_ptr_b + i);
 		}
 
 
@@ -311,8 +277,8 @@ __global__ void compute_hgemm_kernel8_slow(half *A, half *B, float *output,int M
 		//wmma::mma_sync(C_frag, A_frag, B_frag, C_frag);
 
 		kk += kk_per_it;
-		lane_ptr_a = A + kk + laneId;//move global ptr
-		lane_ptr_b = B + kk + laneId;
+		lane_ptr_a += kk_per_it;
+		lane_ptr_b += kk_per_it * N;
 	}
 	wmma::store_matrix_sync(c_buff + warpId * 256, C_frag, 16, wmma::mem_row_major);
 	__syncthreads();//必要
@@ -423,15 +389,28 @@ __global__ void compute_hgemm_kernel4_pad(half *A, half *B, float *output, int M
 	copy_t *lane_shared_ptr_b = (copy_t *)(warp_b_buff + laneId);
 	//global ptr of each lane
 	copy_t *lane_ptr_a = A + kk + (laneId / 16) * K + (laneId % 16);
-	copy_t *lane_ptr_b = B + kk + (laneId / 16) * K + (laneId % 16);
+	copy_t *lane_ptr_b = B +  (laneId / 16) + (kk + (laneId % 16)) * N;
 
+	// if(blockId == 0 && threadIdx.x < 256){
+	// 	if((threadIdx.x % 64) < K - tail_k){
+	// 		half *lane_ptr_taila = A + (threadIdx.x/64)*K + threadIdx.x % 64 + tail_k;
+	// 		half *lane_ptr_tailb = B + (threadIdx.x/64) + (threadIdx.x % 64 + tail_k) * N;
+	// 		tail_buffer[((threadIdx.x%64)/16)*64 + (threadIdx.x/64)*16 + threadIdx.x%16] =  *lane_ptr_taila;
+	// 		tail_buffer[((threadIdx.x%64)/16)*64 + (threadIdx.x/64)*16 + threadIdx.x%16 + 256] =  *lane_ptr_tailb;
+	// 	}
+	// 	__syncthreads();//必要
+	// 	if(warpId == 0){ 
+	// 		wmma::load_matrix_sync(A_frag, tail_buffer, 16);
+	// 		wmma::load_matrix_sync(B_frag, tail_buffer + 256, 16);
+	// 		wmma::mma_sync(C_frag, A_frag, B_frag, C_frag);
+	// 	}
+	// }
 	
-	while(kk < tail_k){ //if k = 2^20, on a grid with 80 * 8 = 640 warps, it'll be k/(WMMA_K*4)/640 = 26 iterations/warp
+	while(kk < K){ //if k = 2^20, on a grid with 80 * 8 = 640 warps, it'll be k/(WMMA_K*4)/640 = 26 iterations/warp
 		for(int i = 0; i < 2; i++){
 			*(lane_shared_ptr_a + i * 32) = *(lane_ptr_a + i * 2 * K);
-			*(lane_shared_ptr_b + i * 32) = *(lane_ptr_b + i * 2 * K);
+			*(lane_shared_ptr_b + i * 32) = *(lane_ptr_b + i * 2);
 		}
-
 
 		wmma::load_matrix_sync(A_frag, warp_a_buff, 16);
 		wmma::load_matrix_sync(B_frag, warp_b_buff, 16);
@@ -440,7 +419,7 @@ __global__ void compute_hgemm_kernel4_pad(half *A, half *B, float *output, int M
 
 		kk += kk_per_it;
 		lane_ptr_a += kk_per_it;
-		lane_ptr_b += kk_per_it;
+		lane_ptr_b += kk_per_it * N;
 	}
 	wmma::store_matrix_sync(c_buff + warpId * 256, C_frag, 16, wmma::mem_row_major);
 	__syncthreads();//必要
