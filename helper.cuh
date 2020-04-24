@@ -29,7 +29,7 @@ void print_matrix(float *mat, size_t M, size_t N){
 	printf("\n");	
 	for(int m=0;m<M;m++){
 		for(int n=0;n<N;n++)
-			printf("%f, ", mat[m*M+n]);
+			printf("%f, ", mat[m*N+n]);
 		printf("\n");
 	}
 }
@@ -38,7 +38,7 @@ void print_matrix(half *mat, size_t M, size_t N){
 	printf("\n");	
 	for(int m=0;m<M;m++){
 		for(int n=0;n<N;n++)
-			printf("%f, ", (float)mat[m*M+n]);
+			printf("%f, ", (float)mat[m*N+n]);
 		printf("\n");
 	}
 }
@@ -47,7 +47,7 @@ __device__ void print_matrix_device(half *mat, size_t M, size_t N){
 	if(blockIdx.x == 0 && threadIdx.x == 0)
 		for(int i=0;i<M;i++){
 			for(int j=0;j<N;j++)
-				printf("%5.2f, ", (float)mat[i*16+j]);
+				printf("%5.2f, ", (float)mat[i*N+j]);
 			printf("\n");
 		}
 }
@@ -56,7 +56,7 @@ __device__ void print_matrix_device(float *mat, size_t M, size_t N){
 	if(blockIdx.x == 0 && threadIdx.x == 0)
 		for(int i=0;i<M;i++){
 			for(int j=0;j<N;j++)
-				printf("%5.2f, ", mat[i*16+j]);
+				printf("%5.2f, ", mat[i*N+j]);
 			printf("\n");
 		}
 }
