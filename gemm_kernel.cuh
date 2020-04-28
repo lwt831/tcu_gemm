@@ -393,9 +393,15 @@ __global__ void compute_hgemm_kernel_general(half *A, half *B, float *output, in
 
 	__syncthreads();
 	//print_matrix_device(a_buff + 1 * 256, 16, 16);////
-	if(1){
+	if(M > N){
 		if(threadIdx.x < seg_num * M * N){
 			int lane_cbuff_index = (threadIdx.x%(M*N)/N)*16 + threadIdx.x%N + (threadIdx.x/(M*N))*(M*16 + M);
+			atomicAdd(output + threadIdx.x%(M*N), c_buff[lane_cbuff_index]);
+		}
+	}
+	else{
+		if(threadIdx.x < seg_num * M * N){
+			int lane_cbuff_index = (threadIdx.x%(M*N)/N)*16 + threadIdx.x%N + (threadIdx.x/(M*N))*(N*16 + N);
 			atomicAdd(output + threadIdx.x%(M*N), c_buff[lane_cbuff_index]);
 		}
 	}
@@ -452,7 +458,7 @@ __global__ void dense_mv(half *A, half *X, float *Y, int M, int K){
 }
 
 template<int BLOCKS_PER_GRID, int WARPS_PER_BLOCK, int WMMA_M, int WMMA_N, int WMMA_K>
-__global__ void compute_hgemm_kernel4_pad(half *A, half *B, float *output, int M, int N, int K, int tail_k){
+__global__ void compute_hgemm_kernel_pad(half *A, half *B, float *output, int M, int N, int K){
 
 	const unsigned int blockId = blockIdx.x;
 	const unsigned int warpId = threadIdx.x / WARP_SIZE;
@@ -483,27 +489,16 @@ __global__ void compute_hgemm_kernel4_pad(half *A, half *B, float *output, int M
 	copy_t *lane_ptr_a = A + kk + (laneId / 16) * K + (laneId % 16);
 	copy_t *lane_ptr_b = B +  (laneId / 16) + (kk + (laneId % 16)) * N;
 
-	// if(blockId == 0 && threadIdx.x < 256){
-	// 	if((threadIdx.x % 64) < K - tail_k){
-	// 		half *lane_ptr_taila = A + (threadIdx.x/64)*K + threadIdx.x % 64 + tail_k;
-	// 		half *lane_ptr_tailb = B + (threadIdx.x/64) + (threadIdx.x % 64 + tail_k) * N;
-	// 		tail_buffer[((threadIdx.x%64)/16)*64 + (threadIdx.x/64)*16 + threadIdx.x%16] =  *lane_ptr_taila;
-	// 		tail_buffer[((threadIdx.x%64)/16)*64 + (threadIdx.x/64)*16 + threadIdx.x%16 + 256] =  *lane_ptr_tailb;
-	// 	}
-	// 	__syncthreads();//必要
-	// 	if(warpId == 0){ 
-	// 		wmma::load_matrix_sync(A_frag, tail_buffer, 16);
-	// 		wmma::load_matrix_sync(B_frag, tail_buffer + 256, 16);
-	// 		wmma::mma_sync(C_frag, A_frag, B_frag, C_frag);
-	// 	}
-	// }
 	
-	while(kk < K){ //if k = 2^20, on a grid with 80 * 8 = 640 warps, it'll be k/(WMMA_K*4)/640 = 26 iterations/warp
-		for(int i = 0; i < 2; i++){
-			*(lane_shared_ptr_a + i * 32) = *(lane_ptr_a + i * 2 * K);
-			*(lane_shared_ptr_b + i * 32) = *(lane_ptr_b + i * 2);
+	while(kk < K){
+		if(laneId < 16){
+			for(int i = 0; i < M; i++){
+				*(lane_shared_ptr_a + i * WMMA_N) = *(lane_ptr_a + i * K);
+			}
+			for(int i = 0; i < N; i++){
+				*(lane_shared_ptr_b + i * WMMA_N) = *(lane_ptr_b + i);
+			}
 		}
-
 		wmma::load_matrix_sync(A_frag, warp_a_buff, 16);
 		wmma::load_matrix_sync(B_frag, warp_b_buff, 16);
 		wmma::mma_sync(C_frag, A_frag, B_frag, C_frag);
@@ -535,8 +530,8 @@ __global__ void compute_hgemm_kernel4_pad(half *A, half *B, float *output, int M
 	}
 	
 	__syncthreads();		
-	if(threadIdx.x < 16){
-		int lane_cbuff_index = (threadIdx.x / 4) * 16 + (threadIdx.x % 4);
+	if(threadIdx.x < M * N){
+		int lane_cbuff_index = (threadIdx.x / N) * WMMA_N + (threadIdx.x % N);
 		atomicAdd(output + threadIdx.x, c_buff[lane_cbuff_index]);
 	}
 	
