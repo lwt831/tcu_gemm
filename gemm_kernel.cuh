@@ -16,298 +16,10 @@
 
 using namespace nvcuda;
 
-template<int BLOCKS_PER_GRID, int WARPS_PER_BLOCK, int WMMA_M, int WMMA_N, int WMMA_K>
-__global__ void compute_hgemm_kernel4_slow(half *A, half *B, float *output, int M, int N, int K, int tail_k){
-
-	const unsigned int blockId = blockIdx.x;
-	const unsigned int warpId = threadIdx.x / WARP_SIZE;
-	const unsigned int laneId = threadIdx.x % WARP_SIZE;
-
-	typedef half copy_t;
-
-	__shared__ half a_buff[WARPS_PER_BLOCK*16*16];
-	__shared__ half b_buff[WARPS_PER_BLOCK*16*16];
-	__shared__ float c_buff[WARPS_PER_BLOCK*16*16];
-	__shared__ half tail_buffer[2*256];
-
-	wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> A_frag;
-	wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> B_frag;
-	wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> C_frag;
-	wmma::fill_fragment(C_frag, 0.0f);
-
-	//loop over K 
-	unsigned int kk = (WARPS_PER_BLOCK * blockId + warpId) * WMMA_K * (WMMA_M / M);
-	const unsigned int kk_per_it = BLOCKS_PER_GRID * WARPS_PER_BLOCK * WMMA_K * (WMMA_M / M);
-	//start point at shared mem of each warp
-	const half *warp_a_buff = a_buff + (warpId * 256);
-	const half *warp_b_buff = b_buff + (warpId * 256);
-	//shared mem ptr of each lane
-	copy_t *lane_shared_ptr_a = (copy_t *)(warp_a_buff + (laneId/16)*64 + laneId%16);
-	copy_t *lane_shared_ptr_b = (copy_t *)(warp_b_buff + (laneId/16)*64 + laneId%16);
-	//global ptr of each lane
-	// copy_t *lane_ptr_a = A + kk + laneId;
-	// copy_t *lane_ptr_b = B + kk + laneId;
-	copy_t *lane_ptr_a = A + kk + laneId;
-	copy_t *lane_ptr_b = B + (kk + laneId) * N;
-	
-	// if(blockId == 0 && threadIdx.x < 256){
-	// 	if((threadIdx.x % 64) < K - tail_k){
-	// 		half *lane_ptr_taila = A + (threadIdx.x/64)*K + threadIdx.x % 64 + tail_k;
-	// 		half *lane_ptr_tailb = B + (threadIdx.x/64) + (threadIdx.x % 64 + tail_k) * N;
-	// 		tail_buffer[((threadIdx.x%64)/16)*64 + (threadIdx.x/64)*16 + threadIdx.x%16] =  *lane_ptr_taila;
-	// 		tail_buffer[((threadIdx.x%64)/16)*64 + (threadIdx.x/64)*16 + threadIdx.x%16 + 256] =  *lane_ptr_tailb;
-	// 	}
-	// 	__syncthreads();//必要
-	// 	if(warpId == 0){ 
-	// 		wmma::load_matrix_sync(A_frag, tail_buffer, 16);
-	// 		wmma::load_matrix_sync(B_frag, tail_buffer + 256, 16);
-	// 		wmma::mma_sync(C_frag, A_frag, B_frag, C_frag);
-	// 	}
-	// }
-
-	while(kk < K){ //if k = 2^20, on a grid with 80 * 8 = 640 warps, it'll be k/(WMMA_K*4)/640 = 26 iterations/warp
-		for(int i = 0; i < M; i++){
-			// *(lane_shared_ptr_a + i * 16) = *(lane_ptr_a + i * K);
-			// *(lane_shared_ptr_b + i * 16) = *(lane_ptr_b + i * K);
-			*(lane_shared_ptr_a + i * 16) = *(lane_ptr_a + i * K);
-			*(lane_shared_ptr_b + i * 16) = *(lane_ptr_b + i);
-		}
-
-
-		for(int i = 0; i < M; i++){
-			*(lane_shared_ptr_a + i * 16 + 128) = *(lane_ptr_a + i * K + 32);
-			*(lane_shared_ptr_b + i * 16 + 128) = *(lane_ptr_b + i + 128);
-		}
-
-		wmma::load_matrix_sync(A_frag, warp_a_buff, 16);
-		wmma::load_matrix_sync(B_frag, warp_b_buff, 16);
-		wmma::mma_sync(C_frag, A_frag, B_frag, C_frag);
-
-		kk += kk_per_it;
-		lane_ptr_a += kk_per_it;
-		lane_ptr_b += kk_per_it * N;
-	}
-	wmma::store_matrix_sync(c_buff + warpId * 256, C_frag, 16, wmma::mem_row_major);
-	__syncthreads();//必要
-
-	//naive block level reduction
-	if(warpId == 0){
-		wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> fetch_c_frag;
-
-		int collect_iter = 1;
-#pragma unroll
-		while(collect_iter < WARPS_PER_BLOCK){
-			wmma::load_matrix_sync(fetch_c_frag, c_buff + collect_iter*256, 16, wmma::mem_row_major);
-#pragma unroll
-			for(int i=0;i<C_frag.num_elements;i++)
-				C_frag.x[i] = C_frag.x[i] + fetch_c_frag.x[i];
-			collect_iter++;			
-		}
-		wmma::store_matrix_sync(c_buff, C_frag, 16, wmma::mem_row_major);//store block level res
-	}
-	
-	__syncthreads();		
-	if(threadIdx.x < 64){
-		int lane_cbuff_index = ((threadIdx.x%16)/4)*16 + threadIdx.x%4 + (threadIdx.x/16)*68;
-		atomicAdd(output + (threadIdx.x%16), c_buff[lane_cbuff_index]);
-		//local atomic -> global atomic
-		// atomicAdd(c_buff  + 256 + (threadIdx.x%16), c_buff[lane_cbuff_index]);
-		// if(threadIdx.x < 16){
-		// 	atomicAdd(output + (threadIdx.x%16), c_buff[256 + lane_cbuff_index]);
-		// }
-	}
-	
-}
-
-
-
-//gemm kernel for dimension = 3
-template<int BLOCKS_PER_GRID, int WARPS_PER_BLOCK, int WMMA_M, int WMMA_N, int WMMA_K>
-__global__ void compute_hgemm_kernel3_slow(half *A, half *B, float *output, int M, int N, int K, int tail_k){
-
-	const unsigned int blockId = blockIdx.x;
-	const unsigned int warpId = threadIdx.x / WARP_SIZE;
-	const unsigned int laneId = threadIdx.x % WARP_SIZE;
-
-	//const unsigned int all_iters = K/WMMA_K;
-	typedef half copy_t;
-
-	__shared__ half a_buff[WARPS_PER_BLOCK*16*16];
-	__shared__ half b_buff[WARPS_PER_BLOCK*16*16];
-	__shared__ float c_buff[WARPS_PER_BLOCK*16*16];
-	__shared__ half tail_buffer[2*256];
-
-	wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> A_frag;
-	wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> B_frag;
-	wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> C_frag;
-	wmma::fill_fragment(C_frag, 0.0f);
-
-	//loop over K 
-	unsigned int kk = (WARPS_PER_BLOCK * blockId + warpId) * WMMA_K * (WMMA_M / M);
-	const unsigned int kk_per_it = BLOCKS_PER_GRID * WARPS_PER_BLOCK * WMMA_K * (WMMA_M / M);
-	//start point at shared mem of each warp
-	const half *warp_a_buff = a_buff + (warpId * 256);
-	const half *warp_b_buff = b_buff + (warpId * 256);
-	//shared mem ptr of each lane
-	copy_t *lane_shared_ptr_a = (copy_t *)(warp_a_buff + (laneId/16)*48 + laneId%16);
-	copy_t *lane_shared_ptr_b = (copy_t *)(warp_b_buff + (laneId/16)*48 + laneId%16);
-	//global ptr of each lane
-	copy_t *lane_ptr_a = A + kk + laneId;
-	copy_t *lane_ptr_b = B + (kk + laneId) * N;
-
-	if(blockId == 0){
-		tail_buffer[threadIdx.x] = (half)0;
-		//tail_buffer[threadIdx.x + 256] = (half)0;
-
-		if((threadIdx.x % 80 ) < K - tail_k && threadIdx.x < 240){
-			half *lane_ptr_taila = A + (threadIdx.x/80)*K + threadIdx.x % 80 + tail_k;
-			half *lane_ptr_tailb = B + (threadIdx.x/80) + (threadIdx.x % 80 + tail_k) * N;
-			tail_buffer[((threadIdx.x%80)/16)*48 + (threadIdx.x/80)*16 + threadIdx.x%16] =  *lane_ptr_taila;
-			tail_buffer[((threadIdx.x%80)/16)*48 + (threadIdx.x/80)*16 + threadIdx.x%16 + 256] =  *lane_ptr_tailb;
-		}
-		__syncthreads();//必要
-		if(warpId == 0){ 
-			wmma::load_matrix_sync(A_frag, tail_buffer, 16);
-			wmma::load_matrix_sync(B_frag, tail_buffer + 256, 16);
-			wmma::mma_sync(C_frag, A_frag, B_frag, C_frag);
-		}
-	}
-
-    while(kk < tail_k){
-		for(int i = 0; i < M; i++){
-		    *(lane_shared_ptr_a + i * 16) = *(lane_ptr_a + i * K);
-			*(lane_shared_ptr_b + i * 16) = *(lane_ptr_b + i);
-		}		
-		for(int i = 0; i < M; i++){
-			*(lane_shared_ptr_a + i * 16 + 96) = *(lane_ptr_a + i * K + 32);
-			*(lane_shared_ptr_b + i * 16 + 96) = *(lane_ptr_b + i + 96);
-		}
-		for(int i = 0; i < M; i++){
-			if(laneId < 16){
-				*(lane_shared_ptr_a + i * 16 + 192) = *(lane_ptr_a + i * K + 64);
-				*(lane_shared_ptr_b + i * 16 + 192) = *(lane_ptr_b + i + 192);
-			}
-		}
-
-		wmma::load_matrix_sync(A_frag, warp_a_buff, 16);
-		wmma::load_matrix_sync(B_frag, warp_b_buff, 16);
-		wmma::mma_sync(C_frag, A_frag, B_frag, C_frag);
-
-		kk += kk_per_it;
-		lane_ptr_a += kk_per_it;
-		lane_ptr_b += kk_per_it * N;
-	}
-	wmma::store_matrix_sync(c_buff + warpId * 256, C_frag, 16, wmma::mem_row_major);
-	__syncthreads();//必要
-
-	//naive block level reduction
-	if(warpId == 0){
-		wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> fetch_c_frag;
-		wmma::fill_fragment(A_frag, 0.0f);
-		wmma::fill_fragment(B_frag, 0.0f);
-
-		int collect_iter = 1;
-#pragma unroll
-		while(collect_iter < WARPS_PER_BLOCK){
-			wmma::load_matrix_sync(fetch_c_frag, c_buff + collect_iter*256, 16, wmma::mem_row_major);
-#pragma unroll
-			for(int i=0;i<C_frag.num_elements;i++)
-				C_frag.x[i] = C_frag.x[i] + fetch_c_frag.x[i];
-			collect_iter++;			
-		}
-		wmma::store_matrix_sync(c_buff, C_frag, 16, wmma::mem_row_major);//store block level res
-	}
-	
-	__syncthreads();		
-	if(threadIdx.x < 45){//mod 45 = 5 * 3 * 3
-		int lane_cbuff_index = ((threadIdx.x%9)/3)*16 + threadIdx.x%3 + (threadIdx.x/9)*51;
-        //atomicAdd(output+ ((threadIdx.x%9)/3)*3 + (threadIdx.x%9)%3, c_buff[lane_cbuff_index]);
-        atomicAdd(output+ threadIdx.x%9, c_buff[lane_cbuff_index]);
-	}
-}
-
-
-
-//gemm kernel for dimension = 8
-template<int BLOCKS_PER_GRID, int WARPS_PER_BLOCK, int WMMA_M, int WMMA_N, int WMMA_K>
-__global__ void compute_hgemm_kernel8_slow(half *A, half *B, float *output,int M, int N, int K, int tail_k){
-
-	const unsigned int blockId = blockIdx.x;
-	const unsigned int warpId = threadIdx.x / WARP_SIZE;
-	const unsigned int laneId = threadIdx.x % WARP_SIZE;
-
-	//const unsigned int all_iters = K/WMMA_K;
-	typedef half copy_t;
-
-	__shared__ half a_buff[WARPS_PER_BLOCK*16*16];
-	__shared__ half b_buff[WARPS_PER_BLOCK*16*16];
-	__shared__ float c_buff[WARPS_PER_BLOCK*16*16];
-	__shared__ half tail_buffer[2*256];
-
-	wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> A_frag;
-	wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> B_frag;
-	wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> C_frag;
-	wmma::fill_fragment(C_frag, 0.0f);
-
-	//loop over K 
-	unsigned int kk = (WARPS_PER_BLOCK * blockId + warpId) * WMMA_K * (WMMA_M / M);//32
-	const unsigned int kk_per_it = BLOCKS_PER_GRID * WARPS_PER_BLOCK * WMMA_K * WMMA_M / M;
-	//start point at shared mem of each warp
-	const half *warp_a_buff = a_buff + (warpId * 256);
-	const half *warp_b_buff = b_buff + (warpId * 256);
-	//shared mem ptr of each lane
-	copy_t *lane_shared_ptr_a = (copy_t *)(warp_a_buff + (laneId/16)*128 + laneId%16);//mod
-	copy_t *lane_shared_ptr_b = (copy_t *)(warp_b_buff + (laneId/16)*128 + laneId%16);
-	//global ptr of each lane
-	copy_t *lane_ptr_a = A + kk + laneId;//mod
-	copy_t *lane_ptr_b = B + (kk + laneId) * N;
-
-    while(kk < K){ //if k    = 2^20, on a grid with 80 * 8 = 640 warps, it'll be k/(WMMA_K*4)/640 = 26 iterations/warp
-		for(int i = 0; i < M; i++){
-			*(lane_shared_ptr_a + i * 16) = *(lane_ptr_a + i * K);
-			*(lane_shared_ptr_b + i * 16) = *(lane_ptr_b + i);
-		}
-
-
-		wmma::load_matrix_sync(A_frag, warp_a_buff, 16);
-		wmma::load_matrix_sync(B_frag, warp_b_buff, 16);
-		wmma::mma_sync(C_frag, A_frag, B_frag, C_frag);
-		//wmma::mma_sync(C_frag, A_frag, B_frag, C_frag);
-
-		kk += kk_per_it;
-		lane_ptr_a += kk_per_it;
-		lane_ptr_b += kk_per_it * N;
-	}
-	wmma::store_matrix_sync(c_buff + warpId * 256, C_frag, 16, wmma::mem_row_major);
-	__syncthreads();//必要
-
-	//naive block level reduction
-	if(warpId == 0){
-		wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> fetch_c_frag;
-
-		int collect_iter = 1;
-#pragma unroll
-		while(collect_iter < WARPS_PER_BLOCK){
-			wmma::load_matrix_sync(fetch_c_frag, c_buff + collect_iter*256, 16, wmma::mem_row_major);
-#pragma unroll
-			for(int i=0;i<C_frag.num_elements;i++)
-				C_frag.x[i] = C_frag.x[i] + fetch_c_frag.x[i];
-			collect_iter++;			
-		}
-		wmma::store_matrix_sync(c_buff, C_frag, 16, wmma::mem_row_major);//store block level res
-	}
-	
-	__syncthreads();		
-	if(threadIdx.x < 128){//mod 128 = 2 * 8 * 8
-		int lane_cbuff_index = ((threadIdx.x%64)/8)*16 + threadIdx.x%8 + (threadIdx.x/64)*136;
-        atomicAdd(output+ threadIdx.x%64, c_buff[lane_cbuff_index]);
-	}
-}
-
 
 //general input kernel(M, N < 16)
 template<int BLOCKS_PER_GRID, int WARPS_PER_BLOCK, int WMMA_M, int WMMA_N, int WMMA_K>
-__global__ void compute_hgemm_kernel_general(half *A, half *B, float *output, int M, int N, int K){
+__global__ void compute_hgemm_fold_general16(half *A, half *B, float *output, int M, int N, int K){
 	const unsigned int blockId = blockIdx.x;
 	const unsigned int warpId = threadIdx.x / WARP_SIZE;
 	const unsigned int laneId = threadIdx.x % WARP_SIZE;
@@ -407,6 +119,89 @@ __global__ void compute_hgemm_kernel_general(half *A, half *B, float *output, in
 	}
 }
 
+template<int WARPS_PER_BLOCK, int WMMA_M, int WMMA_N, int WMMA_K>
+__global__ void compute_hgemm_skinny_wide(half *A, half *B, float *output, int M, int N, int K){//suppose M <= 16 and N is multiple of 16
+	if(blockIdx.y >= N / 16){//多余的block什么都不做
+		return;
+	}
+
+	const unsigned int warpId = threadIdx.x / WARP_SIZE;
+	const unsigned int laneId = threadIdx.x % WARP_SIZE;
+
+	__shared__ half a_buff[WARPS_PER_BLOCK*16*16];
+	__shared__ half b_buff[WARPS_PER_BLOCK*16*16];
+	__shared__ float c_buff[WARPS_PER_BLOCK*16*16];
+
+	wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> A_frag;
+	wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> B_frag;
+	wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> C_frag;
+	wmma::fill_fragment(C_frag, 0.0f);
+
+	typedef half copy_t;
+	//loop over K
+	unsigned int kk = (WARPS_PER_BLOCK * blockIdx.x + warpId) * WMMA_K;
+	const unsigned int kk_per_it = gridDim.x * WARPS_PER_BLOCK * WMMA_K;
+	//start point at shared mem of each warp
+	const half *warp_a_buff = a_buff + (warpId * 256);
+	const half *warp_b_buff = b_buff + (warpId * 256);
+	//shared mem ptr of each lane
+	copy_t *lane_shared_ptr_a = (copy_t *)(warp_a_buff + laneId);
+	copy_t *lane_shared_ptr_b = (copy_t *)(warp_b_buff + laneId);
+
+	copy_t *lane_ptr_a = A + kk + laneId;
+	copy_t *lane_ptr_b = B + (kk + laneId) * N + blockIdx.y * 16;
+
+	while(kk < K){
+		if(laneId < 16){
+			for(int i = 0; i < M; i++){
+				*(lane_shared_ptr_a + i * WMMA_N) = *(lane_ptr_a + i * K);
+			}
+			for(int i = 0; i < 16; i++){
+				*(lane_shared_ptr_b + i * WMMA_N) = *(lane_ptr_b + i);
+			}
+		}
+		wmma::load_matrix_sync(A_frag, warp_a_buff, 16);
+		wmma::load_matrix_sync(B_frag, warp_b_buff, 16);
+		wmma::mma_sync(C_frag, A_frag, B_frag, C_frag);
+
+		kk += kk_per_it;
+		lane_ptr_a += kk_per_it;
+		lane_ptr_b += kk_per_it * N;
+	}
+	wmma::store_matrix_sync(c_buff + warpId * 256, C_frag, 16, wmma::mem_row_major);
+	__syncthreads();//必要
+
+	//naive block level reduction
+	if(warpId == 0){
+		wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> fetch_c_frag;
+		wmma::fill_fragment(A_frag, 0.0f);
+		wmma::fill_fragment(B_frag, 0.0f);
+
+		int collect_iter = 1;
+#pragma unroll
+		while(collect_iter < WARPS_PER_BLOCK){
+			wmma::load_matrix_sync(fetch_c_frag, c_buff + collect_iter * 256, 16, wmma::mem_row_major);//load c of each warp from shared memory
+#pragma unroll
+			for(int i = 0;i < C_frag.num_elements;i++)
+				C_frag.x[i] = C_frag.x[i] + fetch_c_frag.x[i];
+			collect_iter++;			
+		}
+		wmma::store_matrix_sync(c_buff, C_frag, 16, wmma::mem_row_major);//store block level res
+	}
+	//TODO blcok level reduction with atomic operation
+	for(int i = 0; i < M; i++){
+
+	}
+	__syncthreads();		
+	if(threadIdx.x < M * 16){
+		unsigned int lane_cbuff_index = threadIdx.x;
+		float* lane_output_addr = output + (threadIdx.x / 16) * N + blockIdx.y * 16 + threadIdx.x % 16;
+		atomicAdd(lane_output_addr, c_buff[lane_cbuff_index]);
+	}
+}
+
+
+
 template<int BLOCKS_PER_GRID, int WARPS_PER_BLOCK>
 __global__ void dense_mv(half *A, half *X, float *Y, int M, int K){
 	
@@ -456,6 +251,9 @@ __global__ void dense_mv(half *A, half *X, float *Y, int M, int K){
 		atomicAdd(lane_global_yptr, y_buff[warpId * 256 + laneId]);
 	
 }
+
+
+
 
 template<int BLOCKS_PER_GRID, int WARPS_PER_BLOCK, int WMMA_M, int WMMA_N, int WMMA_K>
 __global__ void compute_hgemm_kernel_pad(half *A, half *B, float *output, int M, int N, int K){
